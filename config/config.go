@@ -14,8 +14,11 @@ const (
 type Context struct {
 	ProjectDir      string
 	ParseGenFile    bool
+	SkipGenerated   bool
 	ParseLevelDepth int
 	TimeReIndex     int
+	PrintIndex      bool
+	WatchEnabled    bool
 }
 
 type Orchestrator struct {
@@ -42,8 +45,11 @@ func NewConfig() (*Config, error) {
 	viper.SetDefault("orchestrator.token", "")
 	viper.SetDefault("context.project_dir", "")
 	viper.SetDefault("context.parse_gen_file", false)
+	viper.SetDefault("context.skip_generated", false)
 	viper.SetDefault("context.parse_level_depth", DefaultLevelDepth)
 	viper.SetDefault("context.time_reindex", DefaultTimeReIndex)
+	viper.SetDefault("context.print_index", false)
+	viper.SetDefault("context.watch_enabled", false)
 	viper.SetDefault("rag.host", "")
 	viper.SetDefault("rag.token", "")
 
@@ -60,8 +66,11 @@ func NewConfig() (*Config, error) {
 		Context: Context{
 			ProjectDir:      viper.GetString("context.project_dir"),
 			ParseGenFile:    viper.GetBool("context.parse_gen_file"),
+			SkipGenerated:   viper.GetBool("context.skip_generated"),
 			ParseLevelDepth: viper.GetInt("context.parse_level_depth"),
 			TimeReIndex:     viper.GetInt("context.time_reindex"),
+			PrintIndex:      viper.GetBool("context.print_index"),
+			WatchEnabled:    viper.GetBool("context.watch_enabled"),
 		},
 		Rag: Rag{
 			Host:  viper.GetString("rag.host"),

@@ -10,11 +10,12 @@ import (
 	"sync"
 	"time"
 
-	"ctxengine/config"
-	"ctxengine/internal/entity"
 	"ctxengine/internal/golang"
 
-	"github.com/fsnotify/fsnotify"
+	"ctxengine/config"
+	"ctxengine/internal/entity"
+	"ctxengine/internal/parsers"
+	"ctxengine/internal/utils"
 )
 
 var (
@@ -37,143 +38,9 @@ var (
 	FileModTimeCache = make(map[string]time.Time)
 )
 
-// attachFunctionsRecursively проходит по всем дочерним функциям родительской функции f
-// и, если для дочерней функции найдено определение в GlobalCodeFunctionIndex, заменяет её.
-// Глубина рекурсии регулируется параметром currentDepth, и не производится привязка, если currentDepth >= maxDepth.
-func attachFunctionsRecursively(f *entity.FuncInfo, currentDepth, maxDepth int, file string) {
-	if currentDepth >= maxDepth {
-		return
-	}
+const workerPoolSize = 100
 
-	// Сначала рекурсивно обходим все дочерние функции, чтобы привязать их вложенные вызовы.
-	for _, child := range f.Functions {
-		attachFunctionsRecursively(child, currentDepth+1, maxDepth, file)
-	}
-
-	// Затем для каждого дочернего элемента пытаемся найти глобальное определение по ключу.
-	for i, child := range f.Functions {
-		if len(child.Name) == 0 {
-			continue
-		}
-		// Ключ формируется по формату "FileName::FuncName"
-		key := fmt.Sprintf("%s::%s", file, child.Name)
-		if resolved, ok := GlobalCodeFunctionIndex[key]; ok {
-			f.Functions[i] = resolved
-		}
-	}
-}
-
-// AttachAllFunctions Пример использования: для каждого файла в глобальном индексе
-// запускаем привязку для всех верхнеуровневых функций.
-func AttachAllFunctions(maxDepth int) {
-	for file, fs := range GlobalCodeIndex {
-		for i := range fs.Functions {
-			attachFunctionsRecursively(fs.Functions[i], 1, maxDepth, file)
-		}
-	}
-}
-
-// CollectFunctions обходит структуру FileCodeStruct и рекурсивно собирает все FuncInfo.
-func CollectFunctions(fs *entity.FileCodeStruct) []*entity.FuncInfo {
-	var funcs []*entity.FuncInfo
-
-	var traverse func(f *entity.FuncInfo)
-	traverse = func(f *entity.FuncInfo) {
-		funcs = append(funcs, f)
-		for _, child := range f.Functions {
-			traverse(child)
-		}
-	}
-
-	for _, f := range fs.Functions {
-		traverse(f)
-	}
-	return funcs
-}
-
-func BuildGlobalFunctionIndex() {
-	for file, fs := range GlobalCodeIndex {
-		funcs := CollectFunctions(fs)
-		for _, f := range funcs {
-			if len(f.Name) == 0 {
-				continue
-			}
-			key := fmt.Sprintf("%s::%s", file, f.Name)
-			if _, exists := GlobalCodeFunctionIndex[key]; !exists {
-				GlobalCodeFunctionIndex[key] = f
-			}
-		}
-	}
-}
-
-// WatchAndReindex следит за изменениями в директории проекта, игнорируя .git
-func WatchAndReindex(cfg *config.Config) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatalf("Ошибка создания наблюдателя: %v", err)
-	}
-	defer watcher.Close()
-
-	// Рекурсивно добавляем наблюдение за директорией, игнорируя .git
-	err = AddWatchersRecursively(watcher, cfg.Context.ProjectDir)
-	if err != nil {
-		log.Fatalf("Ошибка добавления наблюдения: %v", err)
-	}
-
-	log.Printf("Наблюдение запущено для директории: %s", cfg.Context.ProjectDir)
-
-	// Дебаунс: если в течение N секунд не появилось новых событий, запускаем переиндексацию.
-	debounceDelay := time.Duration(cfg.Context.TimeReIndex) * time.Second
-	var timer *time.Timer
-
-	resetTimer := func() {
-		if timer != nil {
-			timer.Stop()
-		}
-		timer = time.AfterFunc(debounceDelay, func() {
-			log.Println("Нет изменений в течение 2 секунд. Запуск переиндексации...")
-			ReindexWithWorkerPool(cfg)
-		})
-	}
-
-	for {
-		select {
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			log.Printf("Обнаружено событие: %s", event)
-			resetTimer()
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("Ошибка наблюдения: %v", err)
-		}
-	}
-}
-
-// AddWatchersRecursively добавляет watcher для всех поддиректорий от корня,
-// пропуская директории, имя которых содержит ".git".
-func AddWatchersRecursively(watcher *fsnotify.Watcher, root string) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		// Если это директория и она содержит ".git" в имени, пропускаем её.
-		if info.IsDir() {
-			// Если имя директории равно ".git", пропускаем её и не идем вглубь.
-			if strings.EqualFold(info.Name(), ".git") {
-				return filepath.SkipDir
-			}
-			log.Printf("Добавляем наблюдение за директорией: %s", path)
-			if err := watcher.Add(path); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
+// watcher/attach функции вынесены в watcher.go и attach.go
 
 // ReindexWithWorkerPool выполняет индексацию файлов с использованием пула воркеров.
 func ReindexWithWorkerPool(cfg *config.Config) {
@@ -189,17 +56,33 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 	startTime := time.Now()
 	ctx := context.Background()
 
+	// Определяем modulePath из go.mod один раз за переиндексацию, только если проект на Go
+	modulePath := ""
+	hasGo := false
+	for _, f := range allFiles {
+		if strings.HasSuffix(strings.ToLower(f), ".go") {
+			hasGo = true
+			break
+		}
+	}
+	if hasGo {
+		if _, err := os.Stat(filepath.Join(cfg.Context.ProjectDir, "go.mod")); err == nil {
+			modulePath = golang.DetectModulePath(cfg.Context.ProjectDir)
+		}
+	}
+
 	// Локальные карты для результатов индексации
 	newCodeIndex := make(map[string]*entity.FileCodeStruct)
 	newCodeFuncIndex := make(map[string]*entity.FuncInfo)
 	newTextIndex := make(map[string]*entity.FileTextStruct)
 	newProtoIndex := make(map[string]*entity.FileProtoStruct)
 	newYamlIndex := make(map[string]*entity.FileYamlStruct)
+	newModTimeCache := make(map[string]time.Time)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	workerPool := make(chan struct{}, 1000)
+	workerPool := make(chan struct{}, workerPoolSize)
 
 	for _, file := range allFiles {
 		wg.Add(1)
@@ -207,6 +90,37 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 		go func(file string) {
 			defer wg.Done()
 			defer func() { <-workerPool }()
+
+			// Проверяем время модификации
+			info, err := os.Stat(file)
+			if err != nil {
+				log.Printf("Не удалось получить Stat для %s: %v", file, err)
+				return
+			}
+			modTime := info.ModTime()
+
+			// Если файл не менялся, копируем из существующих индексов
+			if prev, ok := FileModTimeCache[file]; ok && !modTime.After(prev) {
+				mu.Lock()
+				if fsStruct, ok := GlobalCodeIndex[file]; ok {
+					newCodeIndex[file] = fsStruct
+					// Переиндексируем функции для файла
+					funcs := CollectFunctions(fsStruct)
+					for _, f := range funcs {
+						key := fmt.Sprintf("%s::%s", file, f.Name)
+						newCodeFuncIndex[key] = f
+					}
+				} else if fsText, ok := GlobalTextIndex[file]; ok {
+					newTextIndex[file] = fsText
+				} else if fsProto, ok := GlobalProtoIndex[file]; ok {
+					newProtoIndex[file] = fsProto
+				} else if fsYaml, ok := GlobalYamlIndex[file]; ok {
+					newYamlIndex[file] = fsYaml
+				}
+				newModTimeCache[file] = modTime
+				mu.Unlock()
+				return
+			}
 
 			typeFile := DetectFileType(file)
 			source, err := ParseFile(file)
@@ -217,13 +131,21 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 
 			switch typeFile {
 			case entity.TypeFileGolang:
-				generated, err := golang.IsGeneratedFile(file, cfg.Context.ParseGenFile)
-				if err != nil {
-					log.Printf("Ошибка обработки файла %s: %v", file, err)
-					return
+				// По умолчанию индексируем все файлы. Если включён флаг SkipGenerated — проверяем и при необходимости пропускаем
+				generated := false
+				if cfg.Context.SkipGenerated {
+					var err error
+					generated, err = utils.IsGeneratedFile(file, true)
+					if err != nil {
+						log.Printf("Ошибка обработки файла %s: %v", file, err)
+						return
+					}
+					if generated {
+						return
+					}
 				}
-
-				fsStruct, err := golang.ParseFile(ctx, file, source, cfg.Context.ParseLevelDepth)
+				parser, _ := parsers.Get(entity.TypeFileGolang)
+				fsStruct, err := parser.Parse(ctx, file, source, cfg.Context.ParseLevelDepth, modulePath)
 				if err != nil {
 					log.Printf("Ошибка парсинга файла %s: %v", file, err)
 					return
@@ -232,20 +154,39 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 
 				mu.Lock()
 				newCodeIndex[file] = fsStruct
-				// Собираем функции
 				funcs := CollectFunctions(fsStruct)
 				for _, f := range funcs {
 					key := fmt.Sprintf("%s::%s", file, f.Name)
 					newCodeFuncIndex[key] = f
 				}
+				newModTimeCache[file] = modTime
 				mu.Unlock()
+			case entity.TypeFilePython:
+				if parser, ok := parsers.Get(entity.TypeFilePython); ok {
+					fsStruct, err := parser.Parse(ctx, file, source, cfg.Context.ParseLevelDepth, modulePath)
+					if err != nil {
+						log.Printf("Ошибка парсинга файла %s: %v", file, err)
+						return
+					}
+					mu.Lock()
+					newCodeIndex[file] = fsStruct
+					funcs := CollectFunctions(fsStruct)
+					for _, f := range funcs {
+						key := fmt.Sprintf("%s::%s", file, f.Name)
+						newCodeFuncIndex[key] = f
+					}
+					newModTimeCache[file] = modTime
+					mu.Unlock()
+				}
 			case entity.TypeText:
+				log.Printf("Текущий язык программирования для файла %s не поддерживается — сохраняем как текст", file)
 				fsStruct := entity.FileTextStruct{
 					FileName: file,
 					Content:  string(source),
 				}
 				mu.Lock()
 				newTextIndex[file] = &fsStruct
+				newModTimeCache[file] = modTime
 				mu.Unlock()
 			case entity.TypeFileProtobuf:
 				fsStruct := entity.FileProtoStruct{
@@ -254,6 +195,7 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 				}
 				mu.Lock()
 				newProtoIndex[file] = &fsStruct
+				newModTimeCache[file] = modTime
 				mu.Unlock()
 			case entity.TypeFileYaml:
 				fsStruct := entity.FileYamlStruct{
@@ -262,9 +204,19 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 				}
 				mu.Lock()
 				newYamlIndex[file] = &fsStruct
+				newModTimeCache[file] = modTime
 				mu.Unlock()
 			default:
-				log.Printf("Текущий язык программирования для файла %s не поддерживается", file)
+				// Для неподдерживаемых языков: логируем и сохраняем содержимое как текст
+				log.Printf("Текущий язык программирования для файла %s не поддерживается — сохраняем как текст", file)
+				fsStruct := entity.FileTextStruct{
+					FileName: file,
+					Content:  string(source),
+				}
+				mu.Lock()
+				newTextIndex[file] = &fsStruct
+				newModTimeCache[file] = modTime
+				mu.Unlock()
 			}
 		}(file)
 	}
@@ -276,6 +228,7 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 	GlobalTextIndex = newTextIndex
 	GlobalProtoIndex = newProtoIndex
 	GlobalYamlIndex = newYamlIndex
+	FileModTimeCache = newModTimeCache
 
 	// Построение глобального индекса функций и привязка дочерних функций
 	BuildGlobalFunctionIndex()
@@ -283,4 +236,19 @@ func ReindexWithWorkerPool(cfg *config.Config) {
 
 	elapsed := time.Since(startTime)
 	log.Printf("Переиндексация завершена за %s", elapsed)
+	if cfg.Context.PrintIndex {
+		// Сохраняем результат индексации в файл debug/result_{n}.txt без вывода в консоль
+		_ = os.MkdirAll("debug", 0o755)
+		// Находим следующий инкремент
+		n := 1
+		for {
+			candidate := filepath.Join("debug", fmt.Sprintf("result_%d.txt", n))
+			if _, err := os.Stat(candidate); os.IsNotExist(err) {
+				content := RenderAllIndexes(GlobalCodeIndex, GlobalCodeFunctionIndex, GlobalTextIndex, GlobalYamlIndex, GlobalProtoIndex)
+				_ = os.WriteFile(candidate, []byte(content), 0o644)
+				break
+			}
+			n++
+		}
+	}
 }

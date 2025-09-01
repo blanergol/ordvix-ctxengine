@@ -91,6 +91,8 @@ func DetectFileType(fileName string) string {
 	return entity.TypeText
 }
 
+// ParseFile читает файл по пути fileName и возвращает его содержимое как срез байт.
+// В случае ошибки чтения возвращает непустую ошибку и пустой срез.
 func ParseFile(fileName string) ([]byte, error) {
 	data, err := os.ReadFile(fileName)
 	if err != nil {

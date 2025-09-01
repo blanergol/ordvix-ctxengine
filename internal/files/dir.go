@@ -5,19 +5,22 @@ import (
 	"path/filepath"
 )
 
-// ReadDirectory обходит указанную директорию (root) рекурсивно и возвращает список
-// всех файлов, найденных в этой директории и во всех её поддиректориях.
-// Если при обходе возникает ошибка, она возвращается сразу.
+// ReadDirectory рекурсивно обходит директорию root и возвращает список файлов (полные пути),
+// пропуская служебные директории.
 func ReadDirectory(root string) ([]string, error) {
-	// Объявляем срез для хранения путей файлов
 	var files []string
-
-	// filepath.WalkDir обходит директорию рекурсивно.
-	// Функция-обработчик вызывается для каждого файла и директории.
+	// WalkDir предпочтительнее Walk для работы с DirEntry
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		// Если при обходе произошла ошибка, возвращаем её.
 		if err != nil {
 			return err
+		}
+		// Пропускаем служебные директории целиком
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "bin", ".idea", ".vscode", ".vs", ".settings", ".fleet", "nbproject":
+				return fs.SkipDir
+			}
 		}
 		// Если текущий элемент не является директорией (то есть это файл),
 		// добавляем его путь в срез.
@@ -27,10 +30,5 @@ func ReadDirectory(root string) ([]string, error) {
 		// Возвращаем nil, чтобы продолжить обход.
 		return nil
 	})
-	// Если ошибка произошла в процессе обхода, возвращаем её.
-	if err != nil {
-		return nil, err
-	}
-	// Возвращаем список файлов.
-	return files, nil
+	return files, err
 }

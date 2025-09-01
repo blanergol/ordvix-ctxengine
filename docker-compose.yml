@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  ctxengine:
+    image: golang:1.22
+    container_name: ctxengine
+    working_dir: /app
+    volumes:
+      # Репозиторий ctxengine (с исходниками и go.mod)
+      - .:/app
+      # Директория проекта, который нужно индексировать, пробрасывается в контейнер
+      - ${PROJECT_DIR:-.}:/host_project:ro
+    environment:
+      # Orchestrator
+      - ORCHESTRATOR_HOST=${ORCHESTRATOR_HOST:-}
+      - ORCHESTRATOR_TOKEN=${ORCHESTRATOR_TOKEN:-}
+      # Context
+      - CONTEXT_PROJECT_DIR=/host_project
+      - CONTEXT_PARSE_GEN_FILE=${CONTEXT_PARSE_GEN_FILE:-false}
+      - CONTEXT_SKIP_GENERATED=${CONTEXT_SKIP_GENERATED:-false}
+      - CONTEXT_PARSE_LEVEL_DEPTH=${CONTEXT_PARSE_LEVEL_DEPTH:-100}
+      - CONTEXT_TIME_REINDEX=${CONTEXT_TIME_REINDEX:-2}
+      - CONTEXT_PRINT_INDEX=${CONTEXT_PRINT_INDEX:-false}
+      - CONTEXT_WATCH_ENABLED=${CONTEXT_WATCH_ENABLED:-false}
+      # RAG
+      - RAG_HOST=${RAG_HOST:-}
+      - RAG_TOKEN=${RAG_TOKEN:-}
+    command: sh -c "go build -o /app/bin/ctxengine ./cmd && /app/bin/ctxengine"
+
